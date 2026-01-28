@@ -6,7 +6,6 @@ usage() {
 Usage: $0 [options]
 
 Required:
-  --cluster <torch|greene>
   --ssh-user <user>
   --scratch-dir <path>
   --log-dir <path>
@@ -29,7 +28,7 @@ Optional:
   --binds <paths>             (default: none)
   --ssh-bind <path>           (default: /home/<ssh-user>/.ssh)
   --consul-ssh-user <user>    (default: ssh-user)
-  --proxyjump <host>          (default: cluster)
+  --proxyjump <host>          (default: required if using consul)
   --local-forwards <forwards> (default: none)
   --consul-port <port>        (default: 2001)
   --consul-endpoint <url>     (default: http://10.18.124.118:8500)
@@ -67,7 +66,6 @@ PROXYJUMP=""
 CONSUL_ENDPOINT="http://10.18.124.118:8500"
 
 # Required params (unset)
-CLUSTER=""
 SSH_USER=""
 SCRATCH_DIR=""
 LOG_DIR=""
@@ -79,7 +77,6 @@ ENTRYPOINT_PATH=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --cluster) CLUSTER="$2"; shift 2 ;;
         --ssh-user) SSH_USER="$2"; shift 2 ;;
         --scratch-dir) SCRATCH_DIR="$2"; shift 2 ;;
         --log-dir) LOG_DIR="$2"; shift 2 ;;
@@ -115,7 +112,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate required
-for var in CLUSTER SSH_USER SCRATCH_DIR LOG_DIR OVERLAY_SRC DOCKER_URL ENTRYPOINT_REPO ENTRYPOINT_COMMIT ENTRYPOINT_PATH; do
+for var in SSH_USER SCRATCH_DIR LOG_DIR OVERLAY_SRC DOCKER_URL ENTRYPOINT_REPO ENTRYPOINT_COMMIT ENTRYPOINT_PATH; do
     if [[ -z "${!var}" ]]; then
         echo "ERROR: --$(echo ${var} | tr '_' '-' | tr '[:upper:]' '[:lower:]') is required"
         usage
@@ -127,7 +124,6 @@ done
 [[ -z "$SERVICE_NAME" ]] && SERVICE_NAME="${IMAGE}-${SSH_USER}"
 [[ -z "$SSH_BIND" ]] && SSH_BIND="/home/${SSH_USER}/.ssh"
 [[ -z "$CONSUL_SSH_USER" ]] && CONSUL_SSH_USER="$SSH_USER"
-[[ -z "$PROXYJUMP" ]] && PROXYJUMP="$CLUSTER"
 
 SIF_PATH="${SCRATCH_DIR}/images/${IMAGE}.sif"
 OVERLAY_PATH="${SCRATCH_DIR}/${IMAGE}.ext3"
@@ -138,27 +134,23 @@ ACCOUNT_DIRECTIVE=""
 
 # ===== MAIN =====
 echo "[1/6] Ensuring directories exist..."
-ssh "$CLUSTER" "mkdir -p ${LOG_DIR} ${TMP_DIR} ${SCRATCH_DIR}/images"
+mkdir -p "${LOG_DIR}" "${TMP_DIR}" "${SCRATCH_DIR}/images"
 
 echo "[2/6] Cancelling existing jobs..."
-ssh "$CLUSTER" bash -s <<EOF
 for jobname in "build_${IMAGE}" "run_${IMAGE}"; do
-    active_jobs=\$(squeue -u ${SSH_USER} -n \$jobname -h -o "%i")
-    if [ -n "\$active_jobs" ]; then
-        echo "Cancelling \$jobname: \$active_jobs"
-        for jobid in \$active_jobs; do scancel \$jobid; done
+    active_jobs=$(squeue -u "${SSH_USER}" -n "$jobname" -h -o "%i")
+    if [ -n "$active_jobs" ]; then
+        echo "Cancelling $jobname: $active_jobs"
+        for jobid in $active_jobs; do scancel "$jobid"; done
     fi
 done
-EOF
 
 echo "[3/6] Checking if build is needed..."
 BUILD_JOB_ID=""
-IMAGE_EXISTS=$(ssh "$CLUSTER" "[ -f ${SIF_PATH} ] && echo exists || echo missing")
 
-if [[ "$FORCE_REBUILD" == "true" || "$IMAGE_EXISTS" == "missing" ]]; then
+if [[ "$FORCE_REBUILD" == "true" || ! -f "$SIF_PATH" ]]; then
     echo "    Submitting build job..."
-    BUILD_OUT=$(ssh "$CLUSTER" bash -s <<EOF
-sbatch <<SLURM
+    BUILD_OUT=$(sbatch <<EOF
 #!/bin/bash
 #SBATCH --job-name=build_${IMAGE}
 #SBATCH --nodes=1
@@ -174,7 +166,6 @@ mkdir -p ${SCRATCH_DIR}/images
 cp -rp ${OVERLAY_SRC} ${OVERLAY_PATH}.gz
 gunzip -f ${OVERLAY_PATH}.gz
 singularity build --force ${SIF_PATH} ${DOCKER_URL}
-SLURM
 EOF
 )
     BUILD_JOB_ID=$(echo "$BUILD_OUT" | grep -oP 'Submitted batch job \K\d+' || true)
@@ -206,8 +197,7 @@ FULL_BINDS="${MANDATORY_BINDS}"
 
 SCRIPT_URL="https://raw.githubusercontent.com/${ENTRYPOINT_REPO}/${ENTRYPOINT_COMMIT}/${ENTRYPOINT_PATH}"
 
-RUN_OUT=$(ssh "$CLUSTER" bash -s <<EOF
-sbatch <<SLURM
+RUN_OUT=$(sbatch <<EOF
 #!/bin/bash
 ${SBATCH_EXCLUSIVE}
 #SBATCH --job-name=run_${IMAGE}
@@ -223,10 +213,10 @@ ${SLURM_DEPENDENCY}
 ${ACCOUNT_DIRECTIVE}
 
 set -euo pipefail
-ENTRYPOINT_FILE=\\\$(mktemp)
-curl -fsSL ${SCRIPT_URL} -o \\\$ENTRYPOINT_FILE
-exec 3<"\\\$ENTRYPOINT_FILE"
-rm "\\\$ENTRYPOINT_FILE"
+ENTRYPOINT_FILE=\$(mktemp)
+curl -fsSL ${SCRIPT_URL} -o \$ENTRYPOINT_FILE
+exec 3<"\$ENTRYPOINT_FILE"
+rm "\$ENTRYPOINT_FILE"
 
 singularity exec ${GPU_SINGULARITY} ${FAKEROOT_SINGULARITY} \\
   --containall --no-home --cleanenv \\
@@ -236,7 +226,6 @@ singularity exec ${GPU_SINGULARITY} ${FAKEROOT_SINGULARITY} \\
   bash <&3
 
 exec 3<&-
-SLURM
 EOF
 )
 
@@ -251,12 +240,15 @@ fi
 if [[ "$NO_CONSUL" == "true" ]]; then
     echo "[5/6] Skipping consul registration (--no-consul)"
 else
+    if [[ -z "$PROXYJUMP" ]]; then
+        echo "ERROR: --proxyjump is required for consul registration (or use --no-consul)"
+        exit 1
+    fi
+
     echo "[5/6] Submitting consul registration job..."
     echo "    Service name: ${SERVICE_NAME}"
-    CONSUL_DEPENDENCY="#SBATCH --dependency=after:${RUN_JOB_ID}"
 
-    ssh "$CLUSTER" bash -s <<EOF
-sbatch <<SLURM
+    sbatch <<EOF
 #!/bin/bash
 #SBATCH --job-name=consul-register
 #SBATCH --nodes=1
@@ -266,39 +258,38 @@ sbatch <<SLURM
 #SBATCH --cpus-per-task=2
 #SBATCH --output=${LOG_DIR}/consul-register-%j.log
 #SBATCH --error=${LOG_DIR}/consul-register-%j.err
-${CONSUL_DEPENDENCY}
+#SBATCH --dependency=after:${RUN_JOB_ID}
 ${ACCOUNT_DIRECTIVE}
 
 set -euo pipefail
 
-JOB_STATE=\\\$(sacct -j ${RUN_JOB_ID} --format=State --noheader | head -n1 | awk '{print \\\$1}')
-if [[ "\\\$JOB_STATE" != "RUNNING" ]]; then
-    echo "Job ${RUN_JOB_ID} not running (state: \\\$JOB_STATE), exiting."
+JOB_STATE=\$(sacct -j ${RUN_JOB_ID} --format=State --noheader | head -n1 | awk '{print \$1}')
+if [[ "\$JOB_STATE" != "RUNNING" ]]; then
+    echo "Job ${RUN_JOB_ID} not running (state: \$JOB_STATE), exiting."
     exit 0
 fi
 
-HOSTNAME=\\\$(sacct -j ${RUN_JOB_ID} --format=NodeList --noheader | awk '{print \\\$1}' | head -n 1)
-FULL_HOSTNAME=\\\$(dig +short -x "\\\$(getent hosts "\\\$HOSTNAME" | awk '{print \\\$1}')" | head -n1)
-[[ -z "\\\$FULL_HOSTNAME" ]] && FULL_HOSTNAME=\\\$HOSTNAME
+HOSTNAME=\$(sacct -j ${RUN_JOB_ID} --format=NodeList --noheader | awk '{print \$1}' | head -n 1)
+FULL_HOSTNAME=\$(dig +short -x "\$(getent hosts "\$HOSTNAME" | awk '{print \$1}')" | head -n1)
+[[ -z "\$FULL_HOSTNAME" ]] && FULL_HOSTNAME=\$HOSTNAME
 
 curl --silent --output /dev/null --request PUT ${CONSUL_ENDPOINT}/v1/agent/service/deregister/${SERVICE_NAME}
 
 TAGS='"user:${CONSUL_SSH_USER}", "proxyjump:${PROXYJUMP}", "ssh"'
 IFS=',' read -ra FORWARDS <<< "${LOCAL_FORWARDS}"
-for forward in "\\\${FORWARDS[@]}"; do
-    forward=\\\$(echo "\\\$forward" | xargs)
-    [[ -n "\\\$forward" ]] && TAGS="\\\$TAGS, \"localforward:\\\$forward\""
+for forward in "\${FORWARDS[@]}"; do
+    forward=\$(echo "\$forward" | xargs)
+    [[ -n "\$forward" ]] && TAGS="\$TAGS, \"localforward:\$forward\""
 done
 
 curl --request PUT --data @- ${CONSUL_ENDPOINT}/v1/agent/service/register <<CONSUL
 {
   "Name": "${SERVICE_NAME}",
-  "Tags": [\\\$TAGS],
-  "Address": "\\\$FULL_HOSTNAME",
+  "Tags": [\$TAGS],
+  "Address": "\$FULL_HOSTNAME",
   "Port": ${CONSUL_PORT}
 }
 CONSUL
-SLURM
 EOF
 fi
 
